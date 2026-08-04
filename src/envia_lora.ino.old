@@ -1,0 +1,452 @@
+#include <Arduino.h>
+#include <lmic.h>
+#include <hal/hal.h>
+#include <SPI.h>
+#include <CayenneLPP.h>
+#include <ArduinoJson.h>
+
+// ===================== CONFIG =====================
+#define USE_SIMULATED_UART 0      // 1 = usa fake UART; 0 = usa Serial1 real
+#define RXD2 13                   // RX da UART que recebe JSON (quando USE_SIMULATED_UART=0)
+
+// Intervalo (segundos) - AGORA VALE PARA SIMULAÇÃO E PARA A LEITURA DA UART
+uint32_t simulateInterval = 10; // em segundos
+
+// Janela de leitura UART dentro de cada ciclo (ms)
+static const uint32_t UART_WINDOW_MS = 2000; // ajuste (2-8s costuma ser bom)
+
+// Controle do ciclo
+static uint32_t cycleStartMs = 0;
+
+// guarda o último JSON completo recebido
+static String g_lastJson = "";
+static volatile bool g_lastJsonReady = false;
+
+// agenda do envio
+static uint32_t lastSendMs = 0;
+
+// ===================== ABP KEYS =====================
+static const PROGMEM u1_t NWKSKEY[16] = {0xB5, 0x38, 0x6E, 0x7F, 0x9D, 0xBC, 0x02, 0xEC, 0x59, 0x08, 0xF8, 0xFD, 0x07, 0xA1, 0xE5, 0x08};
+static const u1_t PROGMEM APPSKEY[16] = {0x37, 0x8A, 0x5B, 0x41, 0xC8, 0x01, 0xC0, 0x72, 0x77, 0x45, 0xCB, 0x5F, 0xBE, 0x77, 0x45, 0x0A};
+static const u4_t DEVADDR = 0x260C3398;
+
+// Callbacks OTAA vazios (ABP)
+void os_getArtEui(u1_t *buf) {}
+void os_getDevEui(u1_t *buf) {}
+void os_getDevKey(u1_t *buf) {}
+
+// Limite 51 bytes
+CayenneLPP lpp(51);
+
+// Buffer do payload pronto para TX
+volatile bool novoPayloadPronto = false;
+uint8_t payloadRecebido[51];
+uint8_t tamanhoPayload = 0;
+
+// Job LMIC (mantido por compatibilidade)
+static osjob_t sendjob;
+
+// Pin mapping (ajuste conforme seu T-Beam)
+const lmic_pinmap lmic_pins = {
+  .nss = 18,
+  .rxtx = LMIC_UNUSED_PIN,
+  .rst = 14,
+  .dio = {26, 33, 32}, // DIO0, DIO1, DIO2 (T-Beam SX1276 típico)
+};
+
+// ===================== SIMULAÇÃO UART (FAKE STREAM) =====================
+#if USE_SIMULATED_UART
+class FakeSerialStream : public Stream {
+public:
+  FakeSerialStream() : head(0), tail(0) {}
+
+  void inject(const char* s) {
+    while (*s) push((uint8_t)*s++);
+  }
+
+  int available() override {
+    return (tail - head + BUFSZ) % BUFSZ;
+  }
+
+  int read() override {
+    if (!available()) return -1;
+    uint8_t c = buf[head];
+    head = (head + 1) % BUFSZ;
+    return c;
+  }
+
+  int peek() override {
+    if (!available()) return -1;
+    return buf[head];
+  }
+
+  void flush() override {}
+
+  size_t write(uint8_t) override { return 0; }
+
+private:
+  static const int BUFSZ = 2048;
+  uint8_t buf[BUFSZ];
+  volatile int head, tail;
+
+  void push(uint8_t c) {
+    int next = (tail + 1) % BUFSZ;
+    if (next == head) return; // cheio -> descarta
+    buf[tail] = c;
+    tail = next;
+  }
+};
+
+FakeSerialStream simUart;
+#endif
+
+// ===================== JSON -> CayenneLPP =====================
+void processJson(const String &jsonStr)
+{
+  Serial.println("JSON recebido:");
+  Serial.println(jsonStr);
+
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, jsonStr);
+
+  if (error)
+  {
+    Serial.print("Erro no parse JSON: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  lpp.reset();
+
+  lpp.addTemperature(1, doc["temperatura_ar"] | 0);
+  lpp.addRelativeHumidity(2, doc["umidade_ar"] | 0);
+  lpp.addAnalogInput(3, doc["umidade_solo"] | 0);
+  lpp.addAnalogInput(4, doc["precipitacao"] | 0);
+  lpp.addDigitalInput(5, doc["chovendo"] | 0);
+  lpp.addAnalogInput(6, doc["velocidade_do_vento"] | 0);
+  lpp.addBarometricPressure(7, doc["pressao_do_ar"] | 0);
+  lpp.addAnalogInput(8, doc["pressao_altitude"] | 0);
+  lpp.addAnalogInput(9, doc["co"] | 0);
+  lpp.addAnalogInput(10, doc["nh3"] | 0);
+  lpp.addAnalogInput(11, doc["no2"] | 0);
+  lpp.addLuminosity(12, doc["co2"] | 0);
+  lpp.addAnalogInput(13, doc["tensao_alimentacao"] | 0);
+
+  float tempoMs = doc["tempo_ligado"] | 0;
+  lpp.addAnalogInput(14, tempoMs / 1000.0f);
+
+  tamanhoPayload = lpp.getSize();
+  if (tamanhoPayload > sizeof(payloadRecebido))
+    tamanhoPayload = sizeof(payloadRecebido);
+
+  memcpy(payloadRecebido, lpp.getBuffer(), tamanhoPayload);
+  novoPayloadPronto = true;
+
+  Serial.print("Payload LPP preparado (");
+  Serial.print(tamanhoPayload);
+  Serial.println(" bytes) -> pronto para LoRa.");
+}
+
+// ===================== Enfileirar TX LoRa =====================
+void queueSend()
+{
+  if (!novoPayloadPronto) return;
+
+  if (LMIC.opmode & OP_TXRXPEND)
+    return;
+
+  Serial.println("Enfileirando TX LoRa do payload recebido...");
+  LMIC_setTxData2(1, payloadRecebido, tamanhoPayload, 0);
+  novoPayloadPronto = false;
+
+  Serial.println("Packet queued.");
+}
+
+// ===================== Poll UART por fechamento de JSON (} ou ]) =====================
+// - NÃO depende de '\n'
+// - começa ao ver '{' ou '['
+// - termina ao fechar corretamente '}' ou ']'
+// - respeita strings e escape (não conta chaves/colchetes dentro de "...")
+void pollStreamJson(Stream &s)
+{
+  static String buf;
+
+  static bool inMsg = false;
+  static int objDepth = 0;       // { }
+  static int arrDepth = 0;       // [ ]
+  static bool inString = false;
+  static bool escape = false;
+
+  const size_t MAX_JSON = 1200;
+
+  while (s.available())
+  {
+    char c = (char)s.read();
+
+    // esperar início
+    if (!inMsg)
+    {
+      if (c == '{' || c == '[')
+      {
+        inMsg = true;
+        buf = "";
+        buf += c;
+
+        objDepth = (c == '{') ? 1 : 0;
+        arrDepth = (c == '[') ? 1 : 0;
+
+        inString = false;
+        escape = false;
+      }
+      continue;
+    }
+
+    // acumulando
+    buf += c;
+
+    if (buf.length() > MAX_JSON)
+    {
+      // descartou
+      inMsg = false;
+      buf = "";
+      objDepth = arrDepth = 0;
+      inString = escape = false;
+      continue;
+    }
+
+    // string/escape
+    if (escape) { escape = false; continue; }
+
+    if (c == '\\')
+    {
+      if (inString) escape = true;
+      continue;
+    }
+
+    if (c == '"')
+    {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString)
+    {
+      if (c == '{') objDepth++;
+      else if (c == '}') objDepth--;
+      else if (c == '[') arrDepth++;
+      else if (c == ']') arrDepth--;
+
+      // mensagem completa
+      if (objDepth == 0 && arrDepth == 0)
+      {
+        String jsonStr = buf;
+        jsonStr.trim();
+
+        // reset parser
+        inMsg = false;
+        buf = "";
+        objDepth = arrDepth = 0;
+        inString = escape = false;
+
+        if (jsonStr.length() > 0)
+        {
+          g_lastJson = jsonStr;       // guarda o último completo
+          g_lastJsonReady = true;
+        }
+      }
+
+      // malformado
+      if (objDepth < 0 || arrDepth < 0)
+      {
+        inMsg = false;
+        buf = "";
+        objDepth = arrDepth = 0;
+        inString = escape = false;
+      }
+    }
+  }
+}
+
+
+// ===================== Eventos LMIC =====================
+void onEvent(ev_t ev)
+{
+  Serial.print(os_getTime());
+  Serial.print(": EV: ");
+  Serial.println(ev);
+
+  switch (ev)
+  {
+    case EV_TXCOMPLETE:
+      Serial.println("EV_TXCOMPLETE (includes waiting for RX windows)");
+      if (LMIC.dataLen)
+      {
+        Serial.println("==========================================");
+        Serial.print("Data Received: ");
+        Serial.write(LMIC.frame + LMIC.dataBeg, LMIC.dataLen);
+        Serial.println();
+        Serial.println("==========================================");
+      }
+      else
+      {
+        Serial.println("==========================================");
+        Serial.println("Nada recebido!");
+        Serial.println("==========================================");
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ===================== Simulação ajustável =====================
+#if USE_SIMULATED_UART
+void simulateUartTick()
+{
+  static unsigned long last = 0;
+  if (millis() - last < simulateInterval * 1000UL) return;
+  last = millis();
+
+  const char* jsonLine =
+    "{\"temperatura_ar\":23.7,\"umidade_ar\":61,\"umidade_solo\":90,"
+    "\"precipitacao\":0,\"chovendo\":0,\"velocidade_do_vento\":2.4,"
+    "\"pressao_do_ar\":1013.2,\"pressao_altitude\":980.1,\"co\":1,\"nh3\":0,"
+    "\"no2\":0,\"co2\":3000,\"tensao_alimentacao\":3.98,\"tempo_ligado\":123456}";
+
+  Serial.print("=== SIMULACAO: injetando JSON no fake UART a cada ");
+  Serial.print(simulateInterval);
+  Serial.println(" s ===");
+
+  simUart.inject(jsonLine);
+}
+#endif
+
+// ===================== Ajuste do intervalo via Serial (USB) =====================
+// Comandos:
+//  - T=60   -> seta intervalo 60 seg
+//  - T?     -> mostra intervalo atual
+void handleSerialCommands()
+{
+  static String cmd = "";
+
+  while (Serial.available())
+  {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+
+    if (c == '\n')
+    {
+      cmd.trim();
+      if (cmd.length() == 0) { cmd = ""; return; }
+
+      if (cmd == "T?")
+      {
+        Serial.print("Intervalo atual (s): ");
+        Serial.println(simulateInterval);
+      }
+      else if (cmd.startsWith("T="))
+      {
+        long v = cmd.substring(2).toInt();
+        if (v < 10) v = 10;
+        if (v > 600) v = 600;
+        simulateInterval = (uint32_t)v;
+
+        Serial.print("Novo intervalo (s): ");
+        Serial.println(simulateInterval);
+      }
+      else
+      {
+        Serial.println("Comando desconhecido. Use: T=60 ou T?");
+      }
+
+      cmd = "";
+      return;
+    }
+
+    cmd += c;
+    if (cmd.length() > 64) cmd = "";
+  }
+}
+
+// ===================== Setup =====================
+void setup()
+{
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println("\nBOOT: iniciou setup()");
+
+#if !USE_SIMULATED_UART
+  Serial1.begin(115200, SERIAL_8N1, RXD2, -1);
+  Serial.println("BOOT: Serial1 ok (real)");
+#else
+  Serial.println("BOOT: usando UART SIMULADA (fake stream)");
+#endif
+
+  // SPI do rádio (ajuste se necessário)
+  SPI.begin(5, 19, 27, 18);
+  Serial.println("BOOT: SPI ok (LoRa)");
+
+  os_init();
+  LMIC_reset();
+
+#ifdef PROGMEM
+  uint8_t appskey[sizeof(APPSKEY)];
+  uint8_t nwkskey[sizeof(NWKSKEY)];
+  memcpy_P(appskey, APPSKEY, sizeof(APPSKEY));
+  memcpy_P(nwkskey, NWKSKEY, sizeof(NWKSKEY));
+  LMIC_setSession(0x1, DEVADDR, nwkskey, appskey);
+#else
+  LMIC_setSession(0x1, DEVADDR, NWKSKEY, APPSKEY);
+#endif
+
+  LMIC_setLinkCheckMode(0);
+  LMIC.dn2Dr = DR_SF7;
+  LMIC_setDrTxpow(DR_SF10, 14);
+
+  for (int i = 0; i < 7; i++) LMIC_disableChannel(i);
+  for (int i = 16; i < 63; i++) LMIC_disableChannel(i);
+
+  // Inicia o ciclo agora
+  cycleStartMs = millis();
+
+  Serial.println("Sistema pronto.");
+  Serial.print("Intervalo (s) para LoRa + UART: ");
+  Serial.println(simulateInterval);
+  Serial.print("Janela UART (ms): ");
+  Serial.println(UART_WINDOW_MS);
+}
+
+// ===================== Loop =====================
+void loop()
+{
+  os_runloop_once();
+  handleSerialCommands();
+
+#if USE_SIMULATED_UART
+  simulateUartTick();
+  pollStreamJson(simUart);   // SEMPRE drena
+#else
+  pollStreamJson(Serial1);   // SEMPRE drena
+#endif
+
+  uint32_t now = millis();
+  uint32_t periodMs = simulateInterval * 1000UL;
+
+  // no tick do intervalo, processa o último JSON completo e envia
+  if (now - lastSendMs >= periodMs)
+  {
+    lastSendMs = now;
+
+    if (g_lastJsonReady)
+    {
+      g_lastJsonReady = false;     // consome o último JSON
+      processJson(g_lastJson);     // gera payload + seta novoPayloadPronto
+      queueSend();                 // enfileira no LMIC
+    }
+    else
+    {
+      Serial.println("Tick: nenhum JSON completo recebido no intervalo.");
+    }
+  }
+}
