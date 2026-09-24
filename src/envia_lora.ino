@@ -8,15 +8,16 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
 #include <math.h>
-
-
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define MODO_TESTE 1   // 1 = random | 0 = ADXL345 real
+#define ADXL_ADDR_1 0x53
+uint8_t adxlAddress = 0;
 Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
-
 // ===================== CONFIG =====================
-
-
 // Intervalo (segundos) - vale para SIMULAÇÃO e para o COMPASSO DE ENVIO
 uint32_t simulateInterval = 10; // em segundos
+
 
 // Se true: no tick, se não houver JSON novo, ainda envia o último payload válido
 static bool SEND_OLD_WHEN_NO_NEW_JSON = true;
@@ -51,110 +52,154 @@ const lmic_pinmap lmic_pins = {
   .dio = {26, 33, 32}, // DIO0, DIO1, DIO2
 };
 
-// ===================== SIMULAÇÃO UART (FAKE STREAM) =====================
-// ===================== JSON -> CayenneLPP =====================
+
 // Doc LPP: https://docs.mydevices.com/docs/lorawan/cayenne-lpp
 void accelsend()
 {
+  float pitch;
+  float roll;
+  float tiltZ;
 
-  sensors_event_t event; 
-  accel.getEvent(&event);
 
-  float ax = event.acceleration.x;
-  float ay = event.acceleration.y;
-  float az = event.acceleration.z;
 
-  // ângulo de inclinação em cada eixo usando atan2 (resultado em radianos → graus)
-  // pitch: inclinação em torno do eixo Y (frente/trás)
-  float pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+  // =========================
+  // MONTA CAYENNE LPP
+  // =========================
 
-  // roll: inclinação em torno do eixo X (esquerda/direita)
-  float roll  = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+  #if MODO_TESTE 
+   float t = millis() / 1000.0;
+  float pitchAlvo = 15.0 * sin(t * 0.10);
+  float rollAlvo  = 10.0 * sin(t * 0.07);
 
-  // tilt Z: ângulo do eixo Z em relação à gravidade (0° = plano, 90° = vertical)
-  float tiltZ = atan2(sqrt(ax * ax + ay * ay), az) * 180.0 / PI;
+  // ---- PERTURBAÇÃO PERIÓDICA ----
+  // A cada ~30s, dispara um "evento" que dura alguns segundos.
+  // Alterna entre TRANCO (impacto curto e forte) e TOMBO (inclinação grande sustentada).
+  static uint32_t proximoEventoS = 30;   // primeiro evento aos 30s
+  static uint32_t fimEventoS     = 0;    // quando o evento atual termina
+  static uint8_t  tipoEvento     = 0;    // 0 = tranco, 1 = tombo
+  static float    tombokPitch    = 0;    // inclinação extra do tombo
+  static float    tombokRoll     = 0;
 
-  
-  // IMPORTANTE: sempre resetar, senão acumula payload antigo
+  uint32_t tS = (uint32_t)t;
+
+  // Dispara novo evento
+  if (tS >= proximoEventoS && tS >= fimEventoS) {
+    tipoEvento = random(0, 2);           // sorteia tipo
+    if (tipoEvento == 0) {
+      // TRANCO: dura 1 segundo
+      fimEventoS = tS + 1;
+      Serial.println(">>> EVENTO: TRANCO <<<");
+    } else {
+      // TOMBO: dura 5 segundos, inclinação forte
+      fimEventoS   = tS + 5;
+      tombokPitch  = random(-70, 71);    // ±70°
+      tombokRoll   = random(-70, 71);
+      Serial.print(">>> EVENTO: TOMBO pitch=");
+      Serial.print(tombokPitch);
+      Serial.print(" roll=");
+      Serial.println(tombokRoll);
+    }
+    proximoEventoS = tS + 30 + random(0, 15);  // próximo em 30-45s
+  }
+
+  // Aplica efeito do evento se estiver ativo
+  bool eventoAtivo = (tS < fimEventoS);
+  float trancoX = 0, trancoY = 0, trancoZ = 0;
+
+  if (eventoAtivo) {
+    if (tipoEvento == 1) {
+      // Tombo: sobrescreve inclinação alvo
+      pitchAlvo = tombokPitch;
+      rollAlvo  = tombokRoll;
+    }
+  }
+
+  // Converte inclinação em componentes de gravidade
+  float g = 9.81;
+  float pr = pitchAlvo * PI / 180.0;
+  float rr = rollAlvo  * PI / 180.0;
+
+  float ax = g * sin(pr);
+  float ay = g * sin(rr) * cos(pr);
+  float az = g * cos(rr) * cos(pr);
+
+  // Aplica TRANCO (pico de aceleração linear, some da gravidade)
+  if (eventoAtivo && tipoEvento == 0) {
+    // Impulso forte e aleatório em algum eixo (±20 m/s², ~2g extra)
+    trancoX = (random(-2000, 2001) / 100.0);
+    trancoY = (random(-2000, 2001) / 100.0);
+    trancoZ = (random(-2000, 2001) / 100.0);
+    ax += trancoX;
+    ay += trancoY;
+    az += trancoZ;
+  }
+
+  // Ruído normal
+  auto ruido = []() {
+    return ((random(0, 1000) / 1000.0) - 0.5) * 0.1;
+  };
+  ax += ruido();
+  ay += ruido();
+  az += ruido();
+
+  Serial.println("=== MODO SIMULACAO ===");
+  #else
+    sensors_event_t event;
+    accel.getEvent(&event);
+    float ax = event.acceleration.x;
+    float ay = event.acceleration.y;
+    float az = event.acceleration.z;
+
+
+    Serial.println("=== MODO SENSOR REAL ===");
+  #endif
+    pitch = atan2(ax,sqrt(ay * ay + az * az)) * 180.0 / PI;
+
+    roll =atan2(ay,sqrt(ax * ax + az * az)) * 180.0 / PI;
+
+    tiltZ =atan2(sqrt(ax * ax + ay * ay),az) * 180.0 / PI;
+
+
   lpp.reset();
 
-  lpp.addAnalogInput(1,  pitch);  // Canal 1: Pitch
-  lpp.addAnalogInput(2,  roll);   // Canal 2: Roll
-  lpp.addAnalogInput(3,  tiltZ);  // Canal 3: Tilt Z
-
+  lpp.addAnalogInput(1, pitch);
+  lpp.addAnalogInput(2, roll);
+  lpp.addAnalogInput(3, tiltZ);
 
   tamanhoPayload = lpp.getSize();
-  if (tamanhoPayload > sizeof(payloadRecebido))
-    tamanhoPayload = sizeof(payloadRecebido);
 
-  memcpy(payloadRecebido, lpp.getBuffer(), tamanhoPayload);
+  if (tamanhoPayload > sizeof(payloadRecebido))
+  {
+    tamanhoPayload = sizeof(payloadRecebido);
+  }
+
+  memcpy( payloadRecebido,lpp.getBuffer(),tamanhoPayload);
+
   novoPayloadPronto = true;
 
   Serial.print("Payload LPP preparado (");
   Serial.print(tamanhoPayload);
-  Serial.println(" bytes) -> pronto para LoRa.");
-    // --- valores brutos ---
-  Serial.print("X: "); Serial.print(ax, 2);
-  Serial.print("  Y: "); Serial.print(ay, 2);
-  Serial.print("  Z: "); Serial.print(az, 2);
-  Serial.println(" m/s^2");
+  Serial.println(" bytes)");
 
-  // --- ângulos calculados ---
-  Serial.print("Pitch: "); Serial.print(pitch, 1); Serial.print(" graus  ");
-  Serial.print("Roll:  "); Serial.print(roll,  1); Serial.print(" graus  ");
-  Serial.print("Tilt Z:"); Serial.print(tiltZ, 1); Serial.println(" graus");
+  Serial.print("Pitch: ");
+  Serial.print(pitch, 1);
+
+  Serial.print(" | Roll: ");
+  Serial.print(roll, 1);
+
+  Serial.print(" | TiltZ: ");
+  Serial.println(tiltZ, 1);
+
   Serial.println("---");
-
 }
 
-// ===================== Ajuste do intervalo via Serial (USB) =====================
+
 // Comandos:
 //  - T=60   -> seta intervalo 60 seg
 //  - T?     -> mostra intervalo atual
 //  - OLD=1  -> envia payload antigo se não houver JSON novo
 //  - OLD=0  -> não envia se não houver JSON novo
-void handleSerialCommands()
-{
-  static String cmd = "";
 
-  while (Serial.available())
-  {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;
-
-    if (c == '\n')
-    {
-      cmd.trim();
-      if (cmd.length() == 0) { cmd = ""; return; }
-
-      if (cmd == "T?")
-      {
-        Serial.print("Intervalo atual (s): ");
-        Serial.println(simulateInterval);
-      }
-      else if (cmd.startsWith("T="))
-      {
-        long v = cmd.substring(2).toInt();
-        if (v < 10) v = 10;
-        if (v > 600) v = 600;
-        simulateInterval = (uint32_t)v;
-
-        Serial.print("Novo intervalo (s): ");
-        Serial.println(simulateInterval);
-      }
-      else 
-      {
-        Serial.println("Comandos: T=60 | T? ");
-      }
-
-      cmd = "";
-      return;
-    }
-
-    cmd += c;
-    if (cmd.length() > 64) cmd = "";
-  }
-}
 
 // ===================== Eventos LMIC =====================
 void onEvent(ev_t ev)
@@ -178,7 +223,6 @@ void onEvent(ev_t ev)
   }
 }
 
-
 static uint32_t g_lastTickMs = 0;
 
 void tickSendIfDue()
@@ -191,9 +235,9 @@ void tickSendIfDue()
 
   if (now - g_lastTickMs < periodMs) return;
   g_lastTickMs = now;
+  Serial.println(simulateInterval);
 
-
-  accelsend();
+  accelsend(); // lê sensor e monta payload LPP
   // tenta enviar (mesmo payload antigo se necessário)
   if (LMIC.opmode & OP_TXRXPEND)
   {
@@ -223,27 +267,22 @@ void tickSendIfDue()
 
 void setup()
 {
+   
   Serial.begin(115200);
   delay(1500);
   Serial.println("\nBOOT: iniciou setup()");
+  #if MODO_TESTE 
+    randomSeed(analogRead(0));
+  #else
+    Wire.begin(SDA_PIN, SCL_PIN);
+    if (!accel.begin(ADXL_ADDR_1)) {
+      Serial.println("Falha no ADXL345!");
+      while (1);
+    }
+    accel.setRange(ADXL345_RANGE_2_G);
+  #endif
 
-
-  // SPI do rádio (T-Beam SX1276 típico)
-  SPI.begin(5, 19, 27, 18);
-  Serial.println("BOOT: SPI ok (LoRa)");
-  
-  Wire.begin(21, 22);
-  if(!accel.begin())
-  {
-    Serial.println("Ooops, no ADXL345 detected ... Check your wiring!");
-    while(1);
-  }
-  accel.setRange(ADXL345_RANGE_16_G);
- // displaySensorDetails();
- // displayDataRate();
- // displayRange();
-  Serial.println("");
-
+  delay(100);
   os_init();
   LMIC_reset();
 
@@ -280,8 +319,6 @@ void setup()
 void loop()
 {
   os_runloop_once();
-  handleSerialCommands();
-
 
   tickSendIfDue();
 }
